@@ -1,4 +1,4 @@
-name: Deploy to FirstVDS
+name: Deploy to QA
 
 on:
   push:
@@ -11,7 +11,7 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     environment: QA
-
+    
     steps:
     - name: Checkout code
       uses: actions/checkout@v3
@@ -25,6 +25,11 @@ jobs:
       run: |
         mkdir -p ~/.ssh
         ssh-keyscan -H -p ${{ secrets.SERVER_PORT }} ${{ secrets.SERVER_HOST }} >> ~/.ssh/known_hosts
+    
+    - name: Install rsync
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y rsync
     
     - name: Deploy to server
       env:
@@ -56,8 +61,14 @@ jobs:
           
           # Загружаем demo данные (только при первом деплое)
           if [ ! -f ".db_initialized" ]; then
-            docker exec -i ecommerce-db-1 sh -c 'exec mysql -u $MYSQL_USER -p$MYSQL_PASSWORD $MYSQL_DATABASE' < ./common/db/dump/dump.sql
-            touch .db_initialized
+            # Получаем правильное имя контейнера
+            DB_CONTAINER=$(docker ps --format "table {{.Names}}" | grep -E "db|mysql" | head -1)
+            if [ ! -z "$DB_CONTAINER" ]; then
+              docker exec -i $DB_CONTAINER sh -c 'exec mysql -u $MYSQL_USER -p$MYSQL_PASSWORD $MYSQL_DATABASE' < ./common/db/dump/dump.sql
+              touch .db_initialized
+            else
+              echo "Warning: Database container not found, skipping data import"
+            fi
           fi
           
           echo "Deployment completed successfully!"
