@@ -10,7 +10,8 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    
+    environment: QA
+
     steps:
     - name: Checkout code
       uses: actions/checkout@v3
@@ -65,6 +66,7 @@ jobs:
   health-check:
     needs: deploy
     runs-on: ubuntu-latest
+    environment: QA
     
     steps:
     - name: Check services health
