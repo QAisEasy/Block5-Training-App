@@ -13,66 +13,94 @@ jobs:
     environment: QA
     
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v3
-    
-    - name: Setup SSH
-      uses: webfactory/ssh-agent@v0.8.0
+    - name: Deploy to server via SSH
+      uses: appleboy/ssh-action@v1.0.0
       with:
-        ssh-private-key: ${{ secrets.SERVER_SSH_KEY }}
-    
-    - name: Add server to known hosts
-      run: |
-        mkdir -p ~/.ssh
-        ssh-keyscan -H -p ${{ secrets.SERVER_PORT }} ${{ secrets.SERVER_HOST }} >> ~/.ssh/known_hosts
-    
-    - name: Install rsync
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y rsync
-    
-    - name: Deploy to server
-      env:
-        HOST: ${{ secrets.SERVER_HOST }}
-        USER: ${{ secrets.SERVER_USER }}
-        PORT: ${{ secrets.SERVER_PORT }}
-      run: |
-        # Копируем файлы на сервер
-        rsync -avz -e "ssh -p $PORT" \
-          --exclude='.git' \
-          --exclude='*.pyc' \
-          --exclude='__pycache__' \
-          --exclude='.env' \
-          --exclude='common/db/mysqldb' \
-          ./ $USER@$HOST:/opt/ecommerce/
-        
-        # Выполняем команды на сервере
-        ssh -p $PORT $USER@$HOST << 'EOF'
-          cd /opt/ecommerce
+        host: ${{ secrets.SERVER_HOST }}
+        username: ${{ secrets.SERVER_USER }}
+        key: ${{ secrets.SERVER_SSH_KEY }}
+        port: ${{ secrets.SERVER_PORT }}
+        script: |
+          # Переходим в директорию проекта
+          cd /opt/ecommerce || {
+            echo "Project directory not found, creating..."
+            sudo mkdir -p /opt/ecommerce
+            sudo chown -R $USER:$USER /opt/ecommerce
+            cd /opt/ecommerce
+          }
           
-          # Даем права на выполнение скрипту
+          # Если репозиторий еще не склонирован, клонируем его
+          if [ ! -d ".git" ]; then
+            echo "Cloning repository..."
+            git clone https://github.com/${{ github.repository }}.git .
+          else
+            echo "Pulling latest changes..."
+            git fetch origin
+            git reset --hard origin/${{ github.ref_name }}
+          fi
+          
+          # Создаем .env файлы если их нет
+          if [ ! -f ".env.db" ]; then
+            echo "Creating .env.db file..."
+            cat > .env.db << 'EOL'
+          MYSQL_ROOT_PASSWORD=rootpassword
+          MYSQL_DATABASE=mydatabase
+          MYSQL_USER=user
+          MYSQL_PASSWORD=password
+          EOL
+          fi
+          
+          if [ ! -f ".env.app" ]; then
+            echo "Creating .env.app file..."
+            cat > .env.app << 'EOL'
+          DATABASE_URL=mysql+pymysql://user:password@db/mydatabase
+          EOL
+          fi
+          
+          if [ ! -f ".env.sales" ]; then
+            echo "Creating .env.sales file..."
+            cat > .env.sales << 'EOL'
+          DATABASE_URL=mysql+pymysql://user:password@db/mydatabase
+          EOL
+          fi
+          
+          # Даем права на выполнение скриптам
           chmod +x docker-manager.sh
           
           # Останавливаем старые контейнеры
+          echo "Stopping old containers..."
+          ./docker-manager.sh stop || true
+          
+          # Запускаем контейнеры
+          echo "Starting containers..."
           ./docker-manager.sh start
           
           # Ждем пока база данных запустится
-          sleep 10
+          echo "Waiting for database to be ready..."
+          sleep 15
           
           # Загружаем demo данные (только при первом деплое)
           if [ ! -f ".db_initialized" ]; then
-            # Получаем правильное имя контейнера
+            echo "Loading demo data..."
+            # Находим контейнер базы данных
             DB_CONTAINER=$(docker ps --format "table {{.Names}}" | grep -E "db|mysql" | head -1)
             if [ ! -z "$DB_CONTAINER" ]; then
-              docker exec -i $DB_CONTAINER sh -c 'exec mysql -u $MYSQL_USER -p$MYSQL_PASSWORD $MYSQL_DATABASE' < ./common/db/dump/dump.sql
-              touch .db_initialized
+              if [ -f "./common/db/dump/dump.sql" ]; then
+                docker exec -i $DB_CONTAINER sh -c 'exec mysql -u user -ppassword mydatabase' < ./common/db/dump/dump.sql && \
+                touch .db_initialized && \
+                echo "Demo data loaded successfully!"
+              else
+                echo "Warning: dump.sql not found"
+              fi
             else
-              echo "Warning: Database container not found, skipping data import"
+              echo "Warning: Database container not found"
             fi
           fi
           
-          echo "Deployment completed successfully!"
-        EOF
+          echo "Deployment completed!"
+          
+          # Показываем статус контейнеров
+          docker ps
 
   health-check:
     needs: deploy
@@ -80,26 +108,37 @@ jobs:
     environment: QA
     
     steps:
-    - name: Check services health
-      env:
-        HOST: ${{ secrets.SERVER_HOST }}
+    - name: Wait for services to start
+      run: sleep 30
+      
+    - name: Check Product Service Health
       run: |
-        sleep 30
-        
-        # Проверяем products service
-        response=$(curl -s -o /dev/null -w "%{http_code}" http://$HOST:8000/docs)
-        if [ $response -eq 200 ]; then
-          echo "✅ Products service is healthy"
+        response=$(curl -s -o /dev/null -w "%{http_code}" http://${{ secrets.SERVER_HOST }}:8000/docs || echo "000")
+        echo "Product Service HTTP Response: $response"
+        if [ "$response" = "200" ]; then
+          echo "✅ Product service is healthy"
         else
-          echo "❌ Products service is not responding"
+          echo "❌ Product service is not responding correctly"
+          echo "Trying to get more info..."
+          curl -v http://${{ secrets.SERVER_HOST }}:8000/docs || true
           exit 1
         fi
-        
-        # Проверяем sales service
-        response=$(curl -s -o /dev/null -w "%{http_code}" http://$HOST:8001/docs)
-        if [ $response -eq 200 ]; then
+    
+    - name: Check Sales Service Health
+      run: |
+        response=$(curl -s -o /dev/null -w "%{http_code}" http://${{ secrets.SERVER_HOST }}:8001/docs || echo "000")
+        echo "Sales Service HTTP Response: $response"
+        if [ "$response" = "200" ]; then
           echo "✅ Sales service is healthy"
         else
-          echo "❌ Sales service is not responding"
+          echo "❌ Sales service is not responding correctly"
+          echo "Trying to get more info..."
+          curl -v http://${{ secrets.SERVER_HOST }}:8001/docs || true
           exit 1
         fi
+    
+    - name: Summary
+      run: |
+        echo "🎉 Deployment successful!"
+        echo "📦 Product Service: http://${{ secrets.SERVER_HOST }}:8000/docs"
+        echo "💰 Sales Service: http://${{ secrets.SERVER_HOST }}:8001/docs"
