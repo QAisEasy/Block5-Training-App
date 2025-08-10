@@ -1,0 +1,92 @@
+name: Deploy to FirstVDS
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+    
+    - name: Setup SSH
+      uses: webfactory/ssh-agent@v0.8.0
+      with:
+        ssh-private-key: ${{ secrets.SERVER_SSH_KEY }}
+    
+    - name: Add server to known hosts
+      run: |
+        mkdir -p ~/.ssh
+        ssh-keyscan -H -p ${{ secrets.SERVER_PORT }} ${{ secrets.SERVER_HOST }} >> ~/.ssh/known_hosts
+    
+    - name: Deploy to server
+      env:
+        HOST: ${{ secrets.SERVER_HOST }}
+        USER: ${{ secrets.SERVER_USER }}
+        PORT: ${{ secrets.SERVER_PORT }}
+      run: |
+        # Копируем файлы на сервер
+        rsync -avz -e "ssh -p $PORT" \
+          --exclude='.git' \
+          --exclude='*.pyc' \
+          --exclude='__pycache__' \
+          --exclude='.env' \
+          --exclude='common/db/mysqldb' \
+          ./ $USER@$HOST:/opt/ecommerce/
+        
+        # Выполняем команды на сервере
+        ssh -p $PORT $USER@$HOST << 'EOF'
+          cd /opt/ecommerce
+          
+          # Даем права на выполнение скрипту
+          chmod +x docker-manager.sh
+          
+          # Останавливаем старые контейнеры
+          ./docker-manager.sh start
+          
+          # Ждем пока база данных запустится
+          sleep 10
+          
+          # Загружаем demo данные (только при первом деплое)
+          if [ ! -f ".db_initialized" ]; then
+            docker exec -i ecommerce-db-1 sh -c 'exec mysql -u $MYSQL_USER -p$MYSQL_PASSWORD $MYSQL_DATABASE' < ./common/db/dump/dump.sql
+            touch .db_initialized
+          fi
+          
+          echo "Deployment completed successfully!"
+        EOF
+
+  health-check:
+    needs: deploy
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Check services health
+      env:
+        HOST: ${{ secrets.SERVER_HOST }}
+      run: |
+        sleep 30
+        
+        # Проверяем products service
+        response=$(curl -s -o /dev/null -w "%{http_code}" http://$HOST:8000/docs)
+        if [ $response -eq 200 ]; then
+          echo "✅ Products service is healthy"
+        else
+          echo "❌ Products service is not responding"
+          exit 1
+        fi
+        
+        # Проверяем sales service
+        response=$(curl -s -o /dev/null -w "%{http_code}" http://$HOST:8001/docs)
+        if [ $response -eq 200 ]; then
+          echo "✅ Sales service is healthy"
+        else
+          echo "❌ Sales service is not responding"
+          exit 1
+        fi
